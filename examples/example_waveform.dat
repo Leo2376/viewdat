@@ -1,0 +1,28 @@
+# GTKWave-Compatible SPICE Waveformat
+# ------------------------------------
+# This file demonstrates the format GTKWave accepts:
+#   TIME,VALUE1,VALUE2,...
+# 
+# To read this in GTKWave:
+#   1. Save the content to a .dat file
+#   2. Run in GTKWave: GTKWave /path/to/output.dat
+#   3. Signals can be selected via the Channel dropdown
+#
+# Generating with NGSPICE:
+#   ngspice -b mycircuit.spice
+#   # NGSPICE writes: time,value1,value2... in .control block
+#   #   meas tran v1 MAX v(node1) from=start to=stop
+#   #   meas tran v2 MAX v(node2) from=start to=stop
+#   #   These points are output as: time1,val1_t1,val1_t2,...
+#
+# The .wrdata command saves a fixed-point format:
+#   wrdata simu/tb_tx_T4_ST.dat v(pad) v(vin)
+# This gives: sim_time, sig1_val, sig2_val, ...
+# which GTKWave parses as floating point.
+
+Format example:
+
+    # Input: ngspice -b circuit.spice output.dat
+    # Output in dat format:
+    0.000000e-09, 1.200000, 0.000000, ...
+    1.818182e-07, 0.150000, 0.050000, ...
