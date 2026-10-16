@@ -3,8 +3,9 @@
  *
  * Usage: viewdat-gui [file.dat]
  *
- * Features: open .dat files, plot all signals vs time, per-signal
- * selector, reference-voltage line, time-only zoom in/out/reset,
+ * Features: open .dat files, plot all signals vs time, left-side signal
+ * browser with per-signal visibility toggles, per-signal selector,
+ * reference-voltage line, time-only zoom in/out/reset,
  * bottom horizontal scrollbar for scrolling in time, SVG export.
  *
  * Zoom applies ONLY to the time (X) axis. The Y (value) axis always
@@ -39,6 +40,20 @@ static gboolean g_updating_scroll = FALSE;
 static int g_show = -1;
 static gboolean g_vref_on = FALSE;
 static double g_vref = 0.0;
+
+/* Left-side signal browser state: per-signal visibility flags. */
+static gboolean *g_vis = NULL;
+static int g_nvis = 0;
+static GtkListStore *g_sig_store = NULL;
+static gboolean g_updating_sig = FALSE;
+
+enum {
+    SIG_COL_VISIBLE = 0,
+    SIG_COL_SWATCH,
+    SIG_COL_NAME,
+    SIG_COL_INDEX,
+    SIG_N_COLS
+};
 
 static const double PALETTE[][3] = {
     {0.12, 0.47, 0.71}, {1.00, 0.50, 0.05}, {0.17, 0.63, 0.17},
@@ -191,10 +206,8 @@ static void render_plot(cairo_t *cr, double W, double H)
     cairo_clip(cr);
 
     int ns = dat_nsignals(&g_dat);
-    int s0 = (g_show >= 0) ? g_show : 0;
-    int s1 = (g_show >= 0) ? g_show : ns - 1;
-    if (s0 < 0) s0 = 0;
-    if (s1 >= ns) s1 = ns - 1;
+    if (ns <= 0)
+        ns = 0;
     int stride = (g_dat.nrows > 4000) ? g_dat.nrows / 4000 : 1;
 
     double tspan = vtmax - vtmin;
@@ -202,7 +215,13 @@ static void render_plot(cairo_t *cr, double W, double H)
     if (!(tspan > 0.0)) tspan = 1.0;
     if (!(vspan > 0.0)) vspan = 1.0;
 
-    for (int s = s0; s <= s1; s++) {
+    for (int s = 0; s < ns; s++) {
+        /* Single-select combo (g_show) and browser checkboxes combine:
+         * a trace draws only if it passes both filters. */
+        if (g_show >= 0 && s != g_show)
+            continue;
+        if (g_vis && s < g_nvis && !g_vis[s])
+            continue;
         const double *c = PALETTE[s % 8];
         cairo_set_source_rgb(cr, c[0], c[1], c[2]);
         cairo_set_line_width(cr, 1.4);
@@ -319,6 +338,81 @@ static void update_status(void)
     gtk_label_set_text(GTK_LABEL(g_status), buf);
 }
 
+static void sig_color_hex(int s, char *buf, size_t len)
+{
+    const double *c = PALETTE[s % 8];
+    int r = (int)(c[0] * 255.0 + 0.5);
+    int g = (int)(c[1] * 255.0 + 0.5);
+    int b = (int)(c[2] * 255.0 + 0.5);
+    if (r < 0) r = 0;
+    if (r > 255) r = 255;
+    if (g < 0) g = 0;
+    if (g > 255) g = 255;
+    if (b < 0) b = 0;
+    if (b > 255) b = 255;
+    snprintf(buf, len, "#%02X%02X%02X", r, g, b);
+}
+
+static void sig_ensure_size(int ns)
+{
+    if (ns <= 0) {
+        free(g_vis);
+        g_vis = NULL;
+        g_nvis = 0;
+        return;
+    }
+    if (ns != g_nvis) {
+        free(g_vis);
+        g_vis = malloc((size_t)ns * sizeof *g_vis);
+        g_nvis = (g_vis != NULL) ? ns : 0;
+    }
+    for (int i = 0; i < g_nvis; i++)
+        g_vis[i] = TRUE;
+}
+
+static void sig_refresh_store(void)
+{
+    if (!g_sig_store)
+        return;
+    g_updating_sig = TRUE;
+    gtk_list_store_clear(g_sig_store);
+    int ns = dat_nsignals(&g_dat);
+    if (g_loaded && ns > 0) {
+        for (int s = 0; s < ns; s++) {
+            char name[32], hex[16];
+            snprintf(name, sizeof name, "Signal %d", s);
+            sig_color_hex(s, hex, sizeof hex);
+            GtkTreeIter it;
+            gtk_list_store_append(g_sig_store, &it);
+            gtk_list_store_set(g_sig_store, &it,
+                               SIG_COL_VISIBLE, (g_vis && s < g_nvis) ? g_vis[s] : TRUE,
+                               SIG_COL_SWATCH, hex,
+                               SIG_COL_NAME, name,
+                               SIG_COL_INDEX, s,
+                               -1);
+        }
+    }
+    g_updating_sig = FALSE;
+}
+
+/* Push visibility flags into the tree model without rebuilding rows. */
+static void sig_push_to_store(void)
+{
+    if (!g_sig_store)
+        return;
+    g_updating_sig = TRUE;
+    GtkTreeIter it;
+    gboolean ok = gtk_tree_model_get_iter_first(GTK_TREE_MODEL(g_sig_store), &it);
+    while (ok) {
+        int idx = -1;
+        gtk_tree_model_get(GTK_TREE_MODEL(g_sig_store), &it, SIG_COL_INDEX, &idx, -1);
+        if (idx >= 0 && idx < g_nvis)
+            gtk_list_store_set(g_sig_store, &it, SIG_COL_VISIBLE, g_vis[idx], -1);
+        ok = gtk_tree_model_iter_next(GTK_TREE_MODEL(g_sig_store), &it);
+    }
+    g_updating_sig = FALSE;
+}
+
 static gboolean load_file(const char *path)
 {
     DatFile nd = { NULL, 0, 0, 0 };
@@ -342,6 +436,9 @@ static gboolean load_file(const char *path)
     gtk_combo_box_set_active(GTK_COMBO_BOX(g_combo), 0);
     g_show = -1;
     g_zoom = 1.0;
+
+    sig_ensure_size(ns);
+    sig_refresh_store();
 
     double tmin, tmax;
     if (data_time_range(&tmin, &tmax))
@@ -387,8 +484,91 @@ static void on_open(GtkButton *btn, gpointer data)
 static void on_combo_changed(GtkComboBox *box, gpointer data)
 {
     (void)data;
+    if (g_updating_sig)
+        return;
     int active = gtk_combo_box_get_active(box);
     g_show = (active == 0) ? -1 : active - 1;
+    /* Combo acts as a quick filter on top of "all checked": reselecting
+     * from the combo re-enables every checkbox so the two stay in sync. */
+    for (int s = 0; s < g_nvis; s++)
+        g_vis[s] = TRUE;
+    sig_push_to_store();
+    gtk_widget_queue_draw(g_area);
+}
+
+static void sig_sync_combo(void)
+{
+    if (!g_combo)
+        return;
+    g_updating_sig = TRUE;
+    int ns = (g_vis != NULL) ? g_nvis : dat_nsignals(&g_dat);
+    int nvis = 0, only = -1;
+    for (int s = 0; s < ns; s++) {
+        if (!g_vis || s >= g_nvis || g_vis[s]) {
+            nvis++;
+            only = s;
+        }
+    }
+    if (nvis == ns)
+        gtk_combo_box_set_active(GTK_COMBO_BOX(g_combo), 0);
+    else if (nvis == 1 && only >= 0)
+        gtk_combo_box_set_active(GTK_COMBO_BOX(g_combo), only + 1);
+    else
+        gtk_combo_box_set_active(GTK_COMBO_BOX(g_combo), -1);
+    /* Keep single-select filter consistent: custom subsets mean "no
+     * combo filter", a single visible signal means "that signal". */
+    if (nvis == ns)
+        g_show = -1;
+    else if (nvis == 1)
+        g_show = only;
+    else if (nvis > 1)
+        g_show = -1;
+    g_updating_sig = FALSE;
+}
+
+static void on_sig_toggled(GtkCellRendererToggle *cell, gchar *path_str, gpointer data)
+{
+    (void)cell; (void)data;
+    if (g_updating_sig || !g_sig_store)
+        return;
+    GtkTreePath *path = gtk_tree_path_new_from_string(path_str);
+    GtkTreeIter it;
+    if (gtk_tree_model_get_iter(GTK_TREE_MODEL(g_sig_store), &it, path)) {
+        int idx = -1;
+        gboolean vis = FALSE;
+        gtk_tree_model_get(GTK_TREE_MODEL(g_sig_store), &it,
+                           SIG_COL_INDEX, &idx,
+                           SIG_COL_VISIBLE, &vis, -1);
+        if (idx >= 0 && idx < g_nvis) {
+            g_vis[idx] = !vis;
+            gtk_list_store_set(g_sig_store, &it, SIG_COL_VISIBLE, g_vis[idx], -1);
+            sig_sync_combo();
+            update_status();
+            gtk_widget_queue_draw(g_area);
+        }
+    }
+    gtk_tree_path_free(path);
+}
+
+static void on_sig_all(GtkButton *btn, gpointer data)
+{
+    (void)btn; (void)data;
+    for (int s = 0; s < g_nvis; s++)
+        g_vis[s] = TRUE;
+    sig_push_to_store();
+    sig_sync_combo();
+    update_status();
+    gtk_widget_queue_draw(g_area);
+}
+
+static void on_sig_none(GtkButton *btn, gpointer data)
+{
+    (void)btn; (void)data;
+    for (int s = 0; s < g_nvis; s++)
+        g_vis[s] = FALSE;
+    sig_push_to_store();
+    sig_sync_combo();
+    update_status();
     gtk_widget_queue_draw(g_area);
 }
 
@@ -529,11 +709,65 @@ int main(int argc, char *argv[]) {
     GtkWidget *exp = gtk_button_new_with_label("Export SVG");
     gtk_box_pack_start(GTK_BOX(bar), exp, FALSE, FALSE, 0);
 
+    /* Main content: left signal browser + right plot area. */
+    GtkWidget *hpaned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
+    gtk_box_pack_start(GTK_BOX(vbox), hpaned, TRUE, TRUE, 0);
+
+    /* Left: signal browser for the currently opened waveform. */
+    GtkWidget *left_vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    gtk_widget_set_size_request(left_vbox, 200, -1);
+    gtk_paned_pack1(GTK_PANED(hpaned), left_vbox, FALSE, FALSE);
+
+    GtkWidget *sig_title = gtk_label_new("Signals");
+    gtk_label_set_xalign(GTK_LABEL(sig_title), 0.0);
+    gtk_box_pack_start(GTK_BOX(left_vbox), sig_title, FALSE, FALSE, 2);
+
+    GtkWidget *sig_btns = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+    gtk_box_pack_start(GTK_BOX(left_vbox), sig_btns, FALSE, FALSE, 0);
+    GtkWidget *all_btn = gtk_button_new_with_label("All");
+    GtkWidget *none_btn = gtk_button_new_with_label("None");
+    gtk_box_pack_start(GTK_BOX(sig_btns), all_btn, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(sig_btns), none_btn, TRUE, TRUE, 0);
+
+    g_sig_store = gtk_list_store_new(SIG_N_COLS,
+                                     G_TYPE_BOOLEAN,
+                                     G_TYPE_STRING,
+                                     G_TYPE_STRING,
+                                     G_TYPE_INT);
+    GtkWidget *sig_view = gtk_tree_view_new_with_model(GTK_TREE_MODEL(g_sig_store));
+    gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(sig_view), FALSE);
+    g_object_unref(g_sig_store);
+
+    GtkCellRenderer *tog = gtk_cell_renderer_toggle_new();
+    g_signal_connect(tog, "toggled", G_CALLBACK(on_sig_toggled), NULL);
+    gtk_tree_view_insert_column_with_attributes(GTK_TREE_VIEW(sig_view), -1, "Show",
+                                                tog, "active", SIG_COL_VISIBLE, NULL);
+
+    GtkCellRenderer *sw = gtk_cell_renderer_text_new();
+    g_object_set(sw, "weight", PANGO_WEIGHT_BOLD, NULL);
+    gtk_tree_view_insert_column_with_attributes(GTK_TREE_VIEW(sig_view), -1, "",
+                                                sw, "text", SIG_COL_SWATCH,
+                                                "foreground", SIG_COL_SWATCH, NULL);
+
+    GtkCellRenderer *nm = gtk_cell_renderer_text_new();
+    gtk_tree_view_insert_column_with_attributes(GTK_TREE_VIEW(sig_view), -1, "Signal",
+                                                nm, "text", SIG_COL_NAME, NULL);
+
+    GtkWidget *sig_scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sig_scroll),
+                                   GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_container_add(GTK_CONTAINER(sig_scroll), sig_view);
+    gtk_box_pack_start(GTK_BOX(left_vbox), sig_scroll, TRUE, TRUE, 0);
+
+    /* Right: plot + time scrollbar. */
+    GtkWidget *right_vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_paned_pack2(GTK_PANED(hpaned), right_vbox, TRUE, FALSE);
+
     /* Plot area. */
     g_area = gtk_drawing_area_new();
     gtk_widget_set_hexpand(g_area, TRUE);
     gtk_widget_set_vexpand(g_area, TRUE);
-    gtk_box_pack_start(GTK_BOX(vbox), g_area, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(right_vbox), g_area, TRUE, TRUE, 0);
     g_signal_connect(g_area, "draw", G_CALLBACK(on_draw), NULL);
 
     /* Bottom horizontal scrollbar for time scrolling when zoomed.
@@ -541,7 +775,7 @@ int main(int argc, char *argv[]) {
     g_hadj = GTK_ADJUSTMENT(gtk_adjustment_new(0, 0, 100, 1, 10, 10));
     g_hscroll = gtk_scrollbar_new(GTK_ORIENTATION_HORIZONTAL, g_hadj);
     gtk_widget_set_sensitive(g_hscroll, FALSE);
-    gtk_box_pack_start(GTK_BOX(vbox), g_hscroll, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(right_vbox), g_hscroll, FALSE, FALSE, 0);
     g_signal_connect(g_hadj, "value-changed", G_CALLBACK(on_scroll_changed), NULL);
 
     g_status = gtk_label_new("No file loaded.");
@@ -555,6 +789,8 @@ int main(int argc, char *argv[]) {
     g_signal_connect(zout, "clicked", G_CALLBACK(on_zoom), (gpointer) "out");
     g_signal_connect(zreset, "clicked", G_CALLBACK(on_zoom), (gpointer) "reset");
     g_signal_connect(exp, "clicked", G_CALLBACK(on_export), NULL);
+    g_signal_connect(all_btn, "clicked", G_CALLBACK(on_sig_all), NULL);
+    g_signal_connect(none_btn, "clicked", G_CALLBACK(on_sig_none), NULL);
 
     gtk_widget_show_all(win);
 
@@ -571,6 +807,7 @@ int main(int argc, char *argv[]) {
     gtk_main();
 
     if (g_path) free(g_path);
+    free(g_vis);
     dat_free(&g_dat);
 
     return 0;
