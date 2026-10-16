@@ -125,8 +125,11 @@ toolbar offers:
 - **Signal selector** — `All signals` overlay or a single `Signal N`.
 - **Vref** — type a voltage (e.g. `0.5`) to draw a dashed red reference
   line; clear the field to hide it.
-- **Zoom + / Zoom − / Reset** — scale both axes around the data centre
-  (0.1×–100×).
+- **Zoom + / Zoom − / Reset** — zoom the time (X) axis only around the
+  current centre (1×–100×). Signal height always fits the full value
+  range.
+- **Bottom horizontal scrollbar** — scroll through time when zoomed in;
+  disabled at 1× (full view).
 - **Export SVG** — save the current view as an 800×400 SVG file.
 
 The status bar shows the file name, row/signal counts, detected layout,
