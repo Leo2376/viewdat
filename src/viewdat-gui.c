@@ -41,11 +41,20 @@ static int g_show = -1;
 static gboolean g_vref_on = FALSE;
 static double g_vref = 0.0;
 
-/* Left-side signal browser state: per-signal visibility flags. */
+/* Left-side signal browser state: per-signal visibility flags.
+ * By default NO signal is shown. Each checked signal gets its own
+ * waveform panel in a vertically stacked, scrollable layout. */
 static gboolean *g_vis = NULL;
 static int g_nvis = 0;
 static GtkListStore *g_sig_store = NULL;
 static gboolean g_updating_sig = FALSE;
+
+/* Stacked waveform panel metrics. */
+#define WAVE_H   200  /* panel height in px              */
+#define WAVE_GAP 6    /* gap between panels              */
+#define WAVE_TOP 18   /* label strip above the trace area */
+#define WAVE_ML  60   /* inner left margin               */
+#define WAVE_MR  10   /* inner right margin              */
 
 enum {
     SIG_COL_VISIBLE = 0,
@@ -157,6 +166,8 @@ static void update_scrollbar(void)
 static void render_plot(cairo_t *cr, double W, double H)
 {
     if (!g_loaded || g_dat.nrows == 0) {
+        cairo_set_source_rgb(cr, 1, 1, 1);
+        cairo_paint(cr);
         cairo_set_source_rgb(cr, 0.4, 0.4, 0.4);
         cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
         cairo_set_font_size(cr, 14);
@@ -165,64 +176,112 @@ static void render_plot(cairo_t *cr, double W, double H)
         return;
     }
 
-    double vtmin, vtmax, vvmin, vvmax;
-    get_view(&vtmin, &vtmax, &vvmin, &vvmax);
-
-    int ML = 70, MR = 15, MT = 12, MB = 40;
-    double pw = (W - ML - MR), ph = H - MT - MB;
-    if (pw < 10) pw = 10;
-    if (ph < 10) ph = 10;
-
-    /* Background. */
+    /* White background everywhere. */
     cairo_set_source_rgb(cr, 1, 1, 1);
     cairo_paint(cr);
 
-    /* Grid. */
-    cairo_set_source_rgb(cr, 0.88, 0.88, 0.88);
-    cairo_set_line_width(cr, 1.0);
-    for (int i = 0; i <= 10; i++) {
-        double x = ML + pw * i / 10.0;
-        cairo_move_to(cr, x, MT);
-        cairo_line_to(cr, x, MT + ph);
-        cairo_stroke(cr);
-    }
-    for (int i = 0; i <= 8; i++) {
-        double y = MT + ph * i / 8.0;
-        cairo_move_to(cr, ML, y);
-        cairo_line_to(cr, ML + pw, y);
-        cairo_stroke(cr);
-    }
-
-    /* Frame. */
-    cairo_set_source_rgb(cr, 0, 0, 0);
-    cairo_set_line_width(cr, 1.0);
-    cairo_rectangle(cr, ML, MT, pw, ph);
-    cairo_stroke(cr);
-
-    /* Clip traces to the plot frame so scrolled-out data doesn't paint
-     * over margins/labels. */
-    cairo_save(cr);
-    cairo_rectangle(cr, ML, MT, pw, ph);
-    cairo_clip(cr);
+    double vtmin, vtmax, vvmin, vvmax;
+    get_view(&vtmin, &vtmax, &vvmin, &vvmax);
+    (void)vvmin; (void)vvmax;
+    double tspan = vtmax - vtmin;
+    if (!(tspan > 0.0))
+        tspan = 1.0;
 
     int ns = dat_nsignals(&g_dat);
     if (ns <= 0)
-        ns = 0;
+        return;
+
+    /* Count checked panels for the hint message. */
+    int shown = 0;
+    for (int s = 0; s < ns; s++)
+        if (g_vis && s < g_nvis && g_vis[s])
+            shown++;
+
+    if (shown == 0) {
+        cairo_set_source_rgb(cr, 0.4, 0.4, 0.4);
+        cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+        cairo_set_font_size(cr, 14);
+        cairo_move_to(cr, 30, H / 2);
+        cairo_show_text(cr, "No signals shown - check signals in the left panel.");
+        return;
+    }
+
     int stride = (g_dat.nrows > 4000) ? g_dat.nrows / 4000 : 1;
+    double x0 = WAVE_ML;
+    double pw = W - WAVE_ML - WAVE_MR;
+    if (pw < 10.0)
+        pw = 10.0;
 
-    double tspan = vtmax - vtmin;
-    double vspan = vvmax - vvmin;
-    if (!(tspan > 0.0)) tspan = 1.0;
-    if (!(vspan > 0.0)) vspan = 1.0;
-
+    int row = 0;
     for (int s = 0; s < ns; s++) {
-        /* Single-select combo (g_show) and browser checkboxes combine:
-         * a trace draws only if it passes both filters. */
-        if (g_show >= 0 && s != g_show)
-            continue;
-        if (g_vis && s < g_nvis && !g_vis[s])
+        if (!g_vis || s >= g_nvis || !g_vis[s])
             continue;
         const double *c = PALETTE[s % 8];
+        double py = row * (double)(WAVE_H + WAVE_GAP); /* panel top      */
+        double ly = py + WAVE_TOP;                     /* panel plot top */
+        double ph = (double)WAVE_H - WAVE_TOP;
+
+        /* Panel interior: light background + frame. */
+        cairo_set_source_rgb(cr, 0.97, 0.97, 0.97);
+        cairo_rectangle(cr, x0, ly, pw, ph);
+        cairo_fill(cr);
+        cairo_set_source_rgb(cr, 0.88, 0.88, 0.88);
+        cairo_set_line_width(cr, 1.0);
+        for (int i = 1; i < 4; i++) {
+            double y = ly + ph * i / 4.0;
+            cairo_move_to(cr, x0, y);
+            cairo_line_to(cr, x0 + pw, y);
+            cairo_stroke(cr);
+        }
+        cairo_set_source_rgb(cr, 0, 0, 0);
+        cairo_rectangle(cr, x0, ly, pw, ph);
+        cairo_stroke(cr);
+
+        /* Panel label in the strip above the trace area. */
+        cairo_set_source_rgb(cr, c[0], c[1], c[2]);
+        cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
+        cairo_set_font_size(cr, 10);
+        char lab[64];
+        snprintf(lab, sizeof lab, "Signal %d", s);
+        cairo_move_to(cr, x0 + 2, py + 13);
+        cairo_show_text(cr, lab);
+
+        /* Y gridlines and per-signal value scale (panel-fit Y). */
+        double svmin, svmax;
+        int have = FALSE;
+        svmin = svmax = 0.0;
+        for (int r = 0; r < g_dat.nrows; r += stride) {
+            double v = dat_value(&g_dat, s, r);
+            if (isnan(v))
+                continue;
+            if (!have) {
+                svmin = svmax = v;
+                have = TRUE;
+            } else {
+                if (v < svmin) svmin = v;
+                if (v > svmax) svmax = v;
+            }
+        }
+        if (!have) {
+            svmin = -0.5;
+            svmax = 0.5;
+        }
+        double pad = (svmax - svmin) * 0.03;
+        svmin -= pad;
+        svmax += pad;
+        if (!(svmax > svmin)) {
+            double mid = (svmax + svmin) / 2.0;
+            svmin = mid - 0.5;
+            svmax = mid + 0.5;
+        }
+        double svspan = svmax - svmin;
+
+        /* Clip the trace to the panel interior. */
+        cairo_save(cr);
+        cairo_rectangle(cr, x0, ly, pw, ph);
+        cairo_clip(cr);
+
+        /* Trace. */
         cairo_set_source_rgb(cr, c[0], c[1], c[2]);
         cairo_set_line_width(cr, 1.4);
         gboolean pen = FALSE;
@@ -234,13 +293,11 @@ static void render_plot(cairo_t *cr, double W, double H)
                 continue;
             }
             if (t < vtmin || t > vtmax) {
-                /* Outside the scrolled view: lift the pen so we don't
-                 * draw a long diagonal across the window. */
                 pen = FALSE;
                 continue;
             }
-            double x = ML + (t - vtmin) / tspan * pw;
-            double y = MT + (vvmax - v) / vspan * ph;
+            double x = x0 + (t - vtmin) / tspan * pw;
+            double y = ly + (svmax - v) / svspan * ph;
             if (pen)
                 cairo_line_to(cr, x, y);
             else {
@@ -249,51 +306,37 @@ static void render_plot(cairo_t *cr, double W, double H)
             }
         }
         cairo_stroke(cr);
-    }
+        cairo_restore(cr);
 
-    /* Reference voltage line (Y is unzoomed, so it stays put). */
-    if (g_vref_on && g_vref >= vvmin && g_vref <= vvmax) {
-        double y = MT + (vvmax - g_vref) / vspan * ph;
-        cairo_set_source_rgb(cr, 0.9, 0.1, 0.1);
-        cairo_set_line_width(cr, 1.2);
-        static const double dash[] = { 6.0, 4.0 };
-        cairo_set_dash(cr, dash, 2, 0);
-        cairo_move_to(cr, ML, y);
-        cairo_line_to(cr, ML + pw, y);
-        cairo_stroke(cr);
-        cairo_set_dash(cr, NULL, 0, 0);
-    }
+        /* Optional Vref line (capped to this panel). */
+        if (g_vref_on) {
+            double vrel = (g_vref - svmin) / svspan;
+            if (vrel >= 0.0 && vrel <= 1.0) {
+                double y = ly + (1.0 - vrel) * ph;
+                cairo_set_source_rgb(cr, 0.9, 0.1, 0.1);
+                cairo_set_line_width(cr, 1.2);
+                static const double dash[] = { 6.0, 4.0 };
+                cairo_set_dash(cr, dash, 2, 0);
+                cairo_move_to(cr, x0, y);
+                cairo_line_to(cr, x0 + pw, y);
+                cairo_stroke(cr);
+                cairo_set_dash(cr, NULL, 0, 0);
+            }
+        }
 
-    cairo_restore(cr);
+        /* Min/max value labels on the left of the panel. */
+        cairo_set_source_rgb(cr, 0, 0, 0);
+        cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+        cairo_set_font_size(cr, 10);
+        snprintf(lab, sizeof lab, "%g", svmax);
+        cairo_move_to(cr, 4, ly + 10);
+        cairo_show_text(cr, lab);
+        snprintf(lab, sizeof lab, "%g", svmin);
+        cairo_move_to(cr, 4, ly + ph);
+        cairo_show_text(cr, lab);
 
-    /* Axis labels: X shows the *visible* time window, Y the full range. */
-    cairo_set_source_rgb(cr, 0, 0, 0);
-    cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-    cairo_set_font_size(cr, 10);
-    char buf[160];
-    double vmin, vmax, tmin, tmax;
-    {
-        double d_tmin, d_tmax, d_vmin, d_vmax;
-        dat_range(&g_dat, &d_tmin, &d_tmax, &d_vmin, &d_vmax);
-        vmin = d_vmin; vmax = d_vmax; tmin = d_tmin; tmax = d_tmax;
+        row++;
     }
-    snprintf(buf, sizeof buf, "%g", vmax);
-    cairo_move_to(cr, 4, MT + 10);
-    cairo_show_text(cr, buf);
-    snprintf(buf, sizeof buf, "%g", vmin);
-    cairo_move_to(cr, 4, MT + ph);
-    cairo_show_text(cr, buf);
-    /* X ticks: label 6 ticks across the visible window. */
-    for (int i = 0; i <= 5; i++) {
-        double t = vtmin + tspan * i / 5.0;
-        snprintf(buf, sizeof buf, "%g", t);
-        cairo_move_to(cr, ML + pw * i / 5.0 - 10, MT + ph + 14);
-        cairo_show_text(cr, buf);
-    }
-    snprintf(buf, sizeof buf, "view t: %g .. %g  (full %g .. %g)",
-             vtmin, vtmax, tmin, tmax);
-    cairo_move_to(cr, ML, H - 8);
-    cairo_show_text(cr, buf);
 }
 
 static void on_scroll_changed(GtkAdjustment *adj, gpointer data)
@@ -367,7 +410,31 @@ static void sig_ensure_size(int ns)
         g_nvis = (g_vis != NULL) ? ns : 0;
     }
     for (int i = 0; i < g_nvis; i++)
-        g_vis[i] = TRUE;
+        g_vis[i] = FALSE;
+}
+
+/* Number of currently checked signals. */
+static int count_selected(void)
+{
+    int n = 0;
+    for (int s = 0; s < g_nvis; s++)
+        if (g_vis[s])
+            n++;
+    return n;
+}
+
+/* Resize the drawing area to exactly fit the stacked panels so the
+ * vertical scrollbar of the scrolled window shows when overflowed. */
+static void sig_update_area_size(void)
+{
+    if (!g_area)
+        return;
+    int n = count_selected();
+    if (n <= 0)
+        gtk_widget_set_size_request(g_area, -1, -1);
+    else
+        gtk_widget_set_size_request(g_area, -1, n * WAVE_H + (n + 1) * WAVE_GAP);
+    gtk_widget_queue_draw(g_area);
 }
 
 static void sig_refresh_store(void)
@@ -385,7 +452,7 @@ static void sig_refresh_store(void)
             GtkTreeIter it;
             gtk_list_store_append(g_sig_store, &it);
             gtk_list_store_set(g_sig_store, &it,
-                               SIG_COL_VISIBLE, (g_vis && s < g_nvis) ? g_vis[s] : TRUE,
+                               SIG_COL_VISIBLE, (g_vis && s < g_nvis) ? g_vis[s] : FALSE,
                                SIG_COL_SWATCH, hex,
                                SIG_COL_NAME, name,
                                SIG_COL_INDEX, s,
@@ -446,9 +513,9 @@ static gboolean load_file(const char *path)
     else
         g_view_t0 = 0.0;
 
+    sig_update_area_size();
     update_scrollbar();
     update_status();
-    gtk_widget_queue_draw(g_area);
     return TRUE;
 }
 
@@ -487,12 +554,13 @@ static void on_combo_changed(GtkComboBox *box, gpointer data)
     if (g_updating_sig)
         return;
     int active = gtk_combo_box_get_active(box);
-    g_show = (active == 0) ? -1 : active - 1;
-    /* Combo acts as a quick filter on top of "all checked": reselecting
-     * from the combo re-enables every checkbox so the two stay in sync. */
+    /* "All signals" (index 0) checks everything, any other entry checks
+     * exactly that one signal. Checking is what drives the stacked view. */
     for (int s = 0; s < g_nvis; s++)
-        g_vis[s] = TRUE;
+        g_vis[s] = (active == 0) ? TRUE : (s == active - 1);
     sig_push_to_store();
+    sig_update_area_size();
+    update_status();
     gtk_widget_queue_draw(g_area);
 }
 
@@ -515,14 +583,6 @@ static void sig_sync_combo(void)
         gtk_combo_box_set_active(GTK_COMBO_BOX(g_combo), only + 1);
     else
         gtk_combo_box_set_active(GTK_COMBO_BOX(g_combo), -1);
-    /* Keep single-select filter consistent: custom subsets mean "no
-     * combo filter", a single visible signal means "that signal". */
-    if (nvis == ns)
-        g_show = -1;
-    else if (nvis == 1)
-        g_show = only;
-    else if (nvis > 1)
-        g_show = -1;
     g_updating_sig = FALSE;
 }
 
@@ -539,13 +599,13 @@ static void on_sig_toggled(GtkCellRendererToggle *cell, gchar *path_str, gpointe
         gtk_tree_model_get(GTK_TREE_MODEL(g_sig_store), &it,
                            SIG_COL_INDEX, &idx,
                            SIG_COL_VISIBLE, &vis, -1);
-        if (idx >= 0 && idx < g_nvis) {
-            g_vis[idx] = !vis;
-            gtk_list_store_set(g_sig_store, &it, SIG_COL_VISIBLE, g_vis[idx], -1);
-            sig_sync_combo();
-            update_status();
-            gtk_widget_queue_draw(g_area);
-        }
+            if (idx >= 0 && idx < g_nvis) {
+                g_vis[idx] = !vis;
+                gtk_list_store_set(g_sig_store, &it, SIG_COL_VISIBLE, g_vis[idx], -1);
+                sig_sync_combo();
+                sig_update_area_size();
+                update_status();
+            }
     }
     gtk_tree_path_free(path);
 }
@@ -557,8 +617,8 @@ static void on_sig_all(GtkButton *btn, gpointer data)
         g_vis[s] = TRUE;
     sig_push_to_store();
     sig_sync_combo();
+    sig_update_area_size();
     update_status();
-    gtk_widget_queue_draw(g_area);
 }
 
 static void on_sig_none(GtkButton *btn, gpointer data)
@@ -568,8 +628,8 @@ static void on_sig_none(GtkButton *btn, gpointer data)
         g_vis[s] = FALSE;
     sig_push_to_store();
     sig_sync_combo();
+    sig_update_area_size();
     update_status();
-    gtk_widget_queue_draw(g_area);
 }
 
 static void on_vref_changed(GtkEntry *entry, gpointer data)
@@ -759,15 +819,23 @@ int main(int argc, char *argv[]) {
     gtk_container_add(GTK_CONTAINER(sig_scroll), sig_view);
     gtk_box_pack_start(GTK_BOX(left_vbox), sig_scroll, TRUE, TRUE, 0);
 
-    /* Right: plot + time scrollbar. */
+    /* Right: stacked waveform panels inside a vertical scroll view,
+     * plus the bottom time scrollbar. */
     GtkWidget *right_vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_paned_pack2(GTK_PANED(hpaned), right_vbox, TRUE, FALSE);
 
-    /* Plot area. */
+    /* Vertical scroll container for the waveform stack. */
+    GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),
+                                   GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+
+    /* Plot area. Its requested height is set to the total height of the
+     * checked panels (see sig_update_area_size), so the scrolled window
+     * automatically grows a vertical scrollbar when panels overflow. */
     g_area = gtk_drawing_area_new();
     gtk_widget_set_hexpand(g_area, TRUE);
-    gtk_widget_set_vexpand(g_area, TRUE);
-    gtk_box_pack_start(GTK_BOX(right_vbox), g_area, TRUE, TRUE, 0);
+    gtk_container_add(GTK_CONTAINER(scroll), g_area);
+    gtk_box_pack_start(GTK_BOX(right_vbox), scroll, TRUE, TRUE, 0);
     g_signal_connect(g_area, "draw", G_CALLBACK(on_draw), NULL);
 
     /* Bottom horizontal scrollbar for time scrolling when zoomed.
